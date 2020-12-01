@@ -1,0 +1,157 @@
+---
+title: "Generalized Additive Models in R"
+author: "Doug Sponsler"
+date: "11/18/2020"
+output: html_document
+---
+
+# Packages
+```{r message=FALSE, warning=FALSE}
+library(mgcv) # pretty much everything you need for GAM analysis 
+library(mgcViz) # improved plotting methods for mgcv GAMs
+library(brms) # a Bayesian modeling package that includes wrappers for mgcv functions
+library(tidyverse) # because I don't remember how to use base R
+```
+
+# Load and process data
+These are honey bee colony weight data collected using data-logging hive scales. The idea behind the project is that we can use colony weight dynamics as an indicator of fluctuation in landscape-scale floral resource availability. Hives were set up at 12 apiaries (i.e. sites), and each apiary included 3 hives. See paper for details: https://esajournals.onlinelibrary.wiley.com/doi/full/10.1002/ecs2.3102
+```{r message=FALSE, warning=FALSE}
+data <- read_csv("./colony_weights.csv") %>% # read in data
+  select(  # select and rename variables of interest
+    timestamp = TimeStamp_round, # a datetime vector
+    timestamp.unix = time, # a unix epoch time vector (units = seconds)
+    scale.id = ScaleID, # a unique identifier for each hive/scale
+    site, # 12 apiary locations
+    weight = wt_recon_norm # cleaned and normalized colony weight
+         ) %>%
+  mutate(scale.id = factor(scale.id), site = factor(site)) # mgcv can only handle factors, not character vectors
+```
+
+# Visualize data
+For a start, we will ignore site and colony distinctions and plot all our data together.  We clearly have a nonlinear pattern. This makes sense, because we believe *a priori* that it is driven by a nonlinear process: floral phenology.
+```{r}
+ggplot(data, aes(timestamp, weight)) +
+  geom_point(alpha = 0.1) + # set alpha to mitigate overplotting
+  theme_light(18)
+ggsave("./fig1.png")
+```
+
+Fitting a straight line to these data is unsatisfying. Maybe a cubic polynomial? No, that is clearly underfitting. How many polynomial terms do we need? Well, an 8th-order polynomial seems to do a reasonable job of fitting the curves in our data, but:  
+
+1. High-order polynomial fits wiggle uninformatively at the high and low ends of the data
+2. No sane person would fit an 8th-order polynomial to anything
+```{r}
+ggplot(data, aes(timestamp, weight)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") + # linear fit
+  labs(color = "Fit") +
+  theme_light(18) +
+  theme(legend.position = "none")
+ggsave("./fig2.png")
+
+ggplot(data, aes(timestamp, weight)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3)) + # 3rd order polynomial fit
+  labs(color = "Fit") +
+  theme_light(18) +
+  theme(legend.position = "none")
+ggsave("./fig3.png")
+
+ggplot(data, aes(timestamp, weight)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 8)) + # 8th order polynomial fit
+  labs(color = "Fit") +
+  theme_light(18) +
+  theme(legend.position = "none")
+ggsave("./fig4.png")
+
+ggplot(data, aes(timestamp, weight)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm", aes(color = "linear")) + # linear fit
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), aes(color = "3-polynomial")) + # 3rd order polynomial fit
+  geom_smooth(method = "lm", formula = y ~ poly(x, 8), aes(color = "8-polynomial")) + # 8th order polynomial fit
+  labs(color = "Fit") +
+  theme_light(18)
+ggsave("./fig5.png")
+```
+
+As usual, though, ggplot has good defaults. If we don't specify the smoothing method, geom_smooth() automatically fits a GAM to our data. Note how it captures the curves of the data while remaining stable at the high and low ends.
+
+This may be fine for quick visualizations, but if we want to do any serious inference, we need both more control and more output. For this, we turn to the package mgcv. 
+```{r}
+ggplot(data, aes(timestamp, weight)) +
+  geom_point(alpha = 0.1) + 
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 20)) +
+  theme_light(18)
+ggsave("./fig6.png")
+```
+
+# A conceptual introduction to GAMs
+## Noam Ross has described generalized additive modeling as an approach intermediate to classical linear modeling and modern machine learning. With linear modeling, interpretation is very simple, but assumptions are stringent, and out-of-sample prediction tends to be poor. Machine learning, on the  other hand, is extremely flexible and great for out-of-sample prediction, but its interpretation can be very difficult.
+
+As ecologists, we're in a difficult situation. Our data almost always violate the assumptions of linear modeling, but we are scientists, not portfolio managers --- answering *why* and *how* matters to us at least as much as prediction. GAMs offer much of the flexibility and predictive power of machine learning while retaining an interpretive logic similar to classical linear modeling. 
+
+# Fitting a simple GAM
+```{r}
+mod1 <- gam(weight ~ # response variable
+              s(timestamp.unix, # explanatory variable
+                k = 20, # number of basis functions = maximum wiggliness (will be penalized down)
+                bs = "gp" # type of basis function; in this case Gaussian process, good for time series data
+                ),
+            data = data, # input data frame
+            method = "REML", # method for penalizing wiggliness; always use REML unless you have a really good reason not to
+            family = "scat", # error family, analogous to GLM syntax; in this case, scat accounts for residuals that are overdispersed but otherwise normal 
+            select = TRUE) %>% # an explanatory variable can be “penalized out” of the model (its smooth reduced to flat line); a form of variable selection.
+  getViz() # convert model to mgcViz object for visualization and diagnostics
+```
+
+# Diagnostics
+```{r}
+check.gamViz(mod1)
+summary(mod1)
+```
+
+# Visualization
+```{r}
+plot(mod1) + theme_light(18)
+```
+
+# Fitting hierarchical GAMs
+The language of hierarchical modeling tends to be as inconsistent as it is opaque. Here's my attempt to summarize. 
+
+*Hierarchical models* are sometimes called *mixed-effect models*, but I don't think these terms should not be understood as synonyms, since models can be hierarchical without having a true distinction between "fixed" and "random" effects (more on these terms below). Hierarchical models are also called *multi-level models*, which seems to me just a slightly clumsier way of saying "hierarchical". I like the term "hierarchical", so that's what I will use.
+
+What makes a model hierarchical is that it recognizes group-structure in your data. Grouping --- when observations are nested within categories, such as sites or years or individual organisms --- is a form of non-independence that would violate the assumptions of most statistical approaches. But there is more than just the accuracy of p-values at stake here. Group structure raises the issue of the so-called *ecological fallacy* and its particular form called *Simpson's paradox*, wherein the effects of a variable within groups could actually be the opposite of the effect of a variable between groups. For example, we can imagine an situation where we are studying biodiversity and abundance through time at a set of *n* sites. If we ignore group (in this case, site) effects, we might find a positive correlation between diversity and abundance. But if we look within sites, we might find diversity decreases with abundance through time, perhaps due to some kind of competitive effect, even though sites with overall high abundance tend to also have overall high diversity. Hierarchical models are made to handle situations like this one, which are very common in ecological studies.
+
+Briefly, I mentioned the terms "fixed" and "random" effects. The best explanation I have heard of these terms was from Jim Clark (Duke University), who defined "fixed effects" as relationships that you expect to be (1) constant across all groups in your data and (2) more or less generalizable beyond your data. "Random effects", in contrast, are relationships that you expect to (1) vary across groups in your data and (2) have little relevance beyond your data. For example, if you are studying the effects of temperature on body size in bees, *sex* would be a fixed effect, since you would always expect females to be larger than males (with a few exceptions, like *Anthidium*), while *region* (let's say your sites were replicated across several temperature gradients) might be a random effect. Note, however, that both *sex* and *region* would be *hierarchical* (i.e. group) effects, insofar as your temperature and body-size data were nested within them. That's why I prefer to speak of "hierarchical models" when we are talking about group effects in general, without assuming whether a group effects is being treated as fixed or random.
+
+
+# Fitting a fully Bayesian GAM
+My recommendation would be to dial-in your setting in mgcv before implementing your model in brms, since the latter is **much** slower.
+```{r}
+options(mc.cores = parallel::detectCores())  # run MCMC chains simultaneously
+
+# With uniformative prior
+brms1 <- brm(weight ~ s(timestamp.unix, k = 20),
+             data = data,
+             iter = 1000,
+             chains = 4,
+             family = gaussian,
+             file = "./brms1")
+
+plot(brms1)
+plot(conditional_smooths(brms1))
+
+# With informative prior
+prior <- set_prior 
+  
+brms2 <- brm(weight ~ s(timestamp.unix, k = 20),
+             data = data,
+             iter = 1000,
+             chains = 4,
+             family = gaussian,
+             file = "./brms1")
+
+plot(brms2)
+plot(conditional_smooths(brms2))
+```
